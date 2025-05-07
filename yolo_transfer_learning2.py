@@ -1,3 +1,5 @@
+import math
+import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -14,27 +16,61 @@ from yolo_datasets import YOLODataset, transform, collate_fn
 num_classes = MODEL_CONFIG['NUM_CLASSES']
 
 
-def bbox_iou(box1, box2, x1y1x2y2=True, CIoU=True, eps=1e-9):
+def bbox_iou(box1, box2, x1y1x2y2=True, CIoU=False, eps=1e-7):
     """
-    Calculates the Intersection over Union (IoU) or Complete IoU (CIoU)
-    between two sets of bounding boxes.
-
+    Calculate IoU between two sets of boxes.
+    
     Args:
-        box1 (torch.Tensor): First set of bounding boxes.
-        box2 (torch.Tensor): Second set of bounding boxes.
-        x1y1x2y2 (bool): If True, the boxes are in (x1, y1, x2, y2) format.
-                         If False, the boxes are in (cx, cy, w, h) format.
-        CIoU (bool): If True, calculate CIoU. Otherwise, calculate IoU.
-        eps (float): A small epsilon to avoid division by zero.
-
-    Returns:
-        torch.Tensor: The IoU or CIoU values.
+        box1 (Tensor): Predicted boxes [N, 4]
+        box2 (Tensor): Target boxes [N, 4]
+        x1y1x2y2 (bool): If True, boxes are [x1,y1,x2,y2]. Else [cx,cy,w,h]
+        CIoU (bool): If True, use Complete IoU loss
+        eps (float): Small value to avoid division by zero
     """
-    # Implement your bbox_iou logic here.
-    # This is a placeholder.
-    print("Warning: Using placeholder bbox_iou function.")
-    # Dummy implementation for demonstration
-    return torch.ones_like(box1[:, 0]) * 0.5 # Example dummy return
+    # Get box coordinates
+    if x1y1x2y2:
+        b1_x1, b1_y1, b1_x2, b1_y2 = box1.T
+        b2_x1, b2_y1, b2_x2, b2_y2 = box2.T
+    else:
+        # Convert from center-width-height to xyxy
+        b1_x1, b1_x2 = box1[:, 0] - box1[:, 2]/2, box1[:, 0] + box1[:, 2]/2
+        b1_y1, b1_y2 = box1[:, 1] - box1[:, 3]/2, box1[:, 1] + box1[:, 3]/2
+        b2_x1, b2_x2 = box2[:, 0] - box2[:, 2]/2, box2[:, 0] + box2[:, 2]/2
+        b2_y1, b2_y2 = box2[:, 1] - box2[:, 3]/2, box2[:, 1] + box2[:, 3]/2
+
+    # Intersection area
+    inter = (torch.min(b1_x2, b2_x2) - torch.max(b1_x1, b2_x1)).clamp(0) * \
+            (torch.min(b1_y2, b2_y2) - torch.max(b1_y1, b2_y1)).clamp(0)
+
+    # Union area
+    w1, h1 = b1_x2 - b1_x1, b1_y2 - b1_y1
+    w2, h2 = b2_x2 - b2_x1, b2_y2 - b2_y1
+    union = w1 * h1 + w2 * h2 - inter + eps
+
+    # IoU
+    iou = inter / union
+    
+    if CIoU:
+        # Implement Complete IoU (https://arxiv.org/abs/1911.08287)
+        cw = torch.max(b1_x2, b2_x2) - torch.min(b1_x1, b2_x1)  # convex width
+        ch = torch.max(b1_y2, b2_y2) - torch.min(b1_y1, b2_y1)  # convex height
+        
+        # Diagonal distance of convex shape
+        c2 = cw**2 + ch**2 + eps
+        
+        # Center distance
+        rho2 = ((b2_x1 + b2_x2 - b1_x1 - b1_x2)**2 + 
+               (b2_y1 + b2_y2 - b1_y1 - b1_y2)**2) / 4
+        
+        # Aspect ratio
+        v = (4 / math.pi**2) * torch.pow(torch.atan(w2/h2) - torch.atan(w1/h1), 2)
+        with torch.no_grad():
+            alpha = v / (v - iou + (1 + eps))
+        
+        return iou - (rho2 / c2 + v * alpha)
+    
+    return iou
+
 
 def distribution_focal_loss(pred, target):
     """
@@ -256,9 +292,28 @@ class YOLOLoss2(nn.Module):
         self.nc = nc
         self.reg_max = reg_max
         self.use_dfl = use_dfl
-        self.box_weight = 7.5
+        self.box_weight = 10    #7.5
         self.cls_weight = 0.5
-        self.dfl_weight = 1.5
+        self.dfl_weight = 2     #1.5
+        
+        # Define anchors for each prediction layer (example values, adjust based on your model)
+        # Format: [width, height] for each anchor at each scale
+        self.anchors = {
+            0: torch.tensor([[10,13], [16,30], [33,23]]),    # P3 anchors
+            1: torch.tensor([[30,61], [62,45], [59,119]]),   # P4 anchors
+            2: torch.tensor([[116,90], [156,198], [373,326]]) # P5 anchors
+        }
+        
+        # Anchor grid counts (how many anchors per position)
+        self.na = {0: 3, 1: 3, 2: 3}  # 3 anchors per position for each scale
+
+    @staticmethod
+    def _wh_iou(wh1, wh2):
+        """Calculate IoU between two sets of widths/heights."""
+        wh1 = wh1[:, None]  # [N,1,2]
+        wh2 = wh2[None]     # [1,M,2]
+        inter = torch.min(wh1, wh2).prod(2)  # [N,M]
+        return inter / (wh1.prod(2) + wh2.prod(2) - inter)  # iou = inter / (area1 + area2 - inter)
 
     def forward(self, preds, targets):
         device = preds[0].device
@@ -270,6 +325,14 @@ class YOLOLoss2(nn.Module):
             stride = 8 * (2 ** i)  # P3:8, P4:16, P5:32
             pred = pred.permute(0, 2, 3, 1)  # [B, H, W, C]
             b, h, w, c = pred.shape
+            
+            # Calculate expected feature size
+            expected_features = 4 * self.reg_max + self.nc
+            if c != expected_features:
+                raise ValueError(f"Prediction shape mismatch. Got {c} features, expected {expected_features}")
+            
+            # Reshape predictions to [B, H, W, 4*reg_max + nc]
+            pred = pred.view(b, h, w, -1)
             
             # Split predictions
             pred_box = pred[..., :4*self.reg_max]  # [B, H, W, 4*reg_max]
@@ -285,6 +348,7 @@ class YOLOLoss2(nn.Module):
                 img_idx = int(t[0].item())
                 if len(t) < 6:  # Skip invalid targets
                     continue
+                    
                 class_id = int(t[1].item())
                 x, y, w_box, h_box = t[2:6]  # Normalized [0,1]
                 
@@ -292,6 +356,7 @@ class YOLOLoss2(nn.Module):
                 grid_x = min(int(x * w), w-1)
                 grid_y = min(int(y * h), h-1)
                 
+                # Assign to grid cell
                 tgt_mask[img_idx, grid_y, grid_x] = True
                 tgt_box[img_idx, grid_y, grid_x] = torch.tensor([x, y, w_box, h_box], device=device)
                 tgt_cls[img_idx, grid_y, grid_x, class_id] = 1.0
@@ -300,17 +365,34 @@ class YOLOLoss2(nn.Module):
             if tgt_mask.any():
                 # Get active predictions and targets
                 pred_box_active = pred_box[tgt_mask]  # [M, 4*reg_max]
-                tgt_box_active = tgt_box[tgt_mask]    # [M, 4]
+                tgt_box_active = tgt_box[tgt_mask]   # [M, 4]
+                
+                # Verify divisible by 4*reg_max
+                if pred_box_active.numel() % (4 * self.reg_max) != 0:
+                    print(f"Warning: Prediction elements {pred_box_active.numel()} not divisible by {4 * self.reg_max}")
+                    continue
                 
                 # Convert targets to distribution targets
                 tgt_ltrb = self._xywh_to_ltrb(tgt_box_active)  # [M, 4]
                 tgt_ltrb = tgt_ltrb * (self.reg_max - 1)  # Scale to reg_max range
                 tgt_ltrb = tgt_ltrb.clamp(0, self.reg_max - 1 - 1e-6)  # CLAMP TO VALID RANGE
                 
-                # DFL loss
-                if self.use_dfl:
-                    pred_box_active = pred_box_active.view(-1, self.reg_max)  # [M*4, reg_max]
-                    dfl_loss += self._df_loss(pred_box_active, tgt_ltrb.view(-1))  # [M*4]
+                # DFL loss - SAFE RESHAPING
+                if self.use_dfl and pred_box_active.numel() > 0:
+                    try:
+                        # First ensure correct number of elements
+                        M = pred_box_active.shape[0]
+                        pred_box_active = pred_box_active.view(M, 4, self.reg_max)
+                        
+                        # Then flatten for DFL loss
+                        pred_box_active = pred_box_active.view(-1, self.reg_max)
+                        tgt_ltrb = tgt_ltrb.view(-1)
+                        
+                        dfl_loss += self._df_loss(pred_box_active, tgt_ltrb)
+                    except Exception as e:
+                        print(f"DFL reshape error: {e}")
+                        print(f"Input shape: {pred_box_active.shape}")
+                        continue
                 
                 # Convert predictions to box coordinates
                 pred_dist = F.softmax(pred_box_active.view(-1, 4, self.reg_max), dim=-1)
@@ -339,22 +421,22 @@ class YOLOLoss2(nn.Module):
         return torch.stack([x - w/2, y - h/2, x + w/2, y + h/2], dim=-1)
 
     def _df_loss(self, pred_dist, target):
-        """Distribution Focal Loss (DFL)."""
-        # Add debug prints
-        # print(f"pred_dist range: {pred_dist.min().item():.4f}-{pred_dist.max().item():.4f}")
-        # print(f"target range: {target.min().item():.4f}-{target.max().item():.4f}")
+        # Add numerical stability
+        pred_dist = F.softmax(pred_dist, dim=-1)  # Ensure proper distribution
+        pred_dist = torch.clamp(pred_dist, min=1e-6, max=1-1e-6)  # Avoid log(0)
         
         target_left = target.long()
         target_right = target_left + 1
         weight_right = target - target_left.float()
         weight_left = 1 - weight_right
         
-        # Additional clamping for safety
+        # Additional clamping
         target_left = target_left.clamp(0, self.reg_max-1)
         target_right = target_right.clamp(0, self.reg_max-1)
         
-        loss_left = F.cross_entropy(pred_dist, target_left, reduction='none') * weight_left
-        loss_right = F.cross_entropy(pred_dist, target_right, reduction='none') * weight_right
+        loss_left = -torch.log(pred_dist.gather(1, target_left.unsqueeze(1))).squeeze(1) * weight_left
+        loss_right = -torch.log(pred_dist.gather(1, target_right.unsqueeze(1))).squeeze(1) * weight_right
+        
         return (loss_left + loss_right).mean()
     
 
@@ -527,6 +609,7 @@ def transfer_learning(args):
     
     for epoch in range(args.epochs):
         for i, (images, targets) in enumerate(dataloader):
+            start_time = time.time()
             images = images.to(args.device)
             targets = [t.to(args.device) for t in targets]
             
@@ -552,19 +635,24 @@ def transfer_learning(args):
             
             # Compute loss
             box_loss, cls_loss, dfl_loss, total_loss = criterion(outputs, targets)
-            # print(f"Computed Loss: Box: {box_loss.item():.4f}, Cls: {cls_loss.item():.4f}, DFL: {dfl_loss.item():.4f}, Total: {total_loss.item():.4f}")
             
             # Backward pass
             optimizer.zero_grad()
-            total_loss.requires_grad = True
-            total_loss.backward()
-            # torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
+            # total_loss.requires_grad = True
+
+            # box_loss.requires_grad = True
+            box_loss.backward(retain_graph=True)
+            cls_loss.backward(retain_graph=True)
+            dfl_loss.backward()
+            # total_loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
             optimizer.step()
+            end_time = time.time()
             
             # if i % 10 == 0:
             print(f"Epoch {epoch+1}/{args.epochs}, Batch {i+1}/{dataloader.__len__()}, "
                     f"Box: {box_loss.item():.4f}, Cls: {cls_loss.item():.4f}, "
-                    f"DFL: {dfl_loss.item():.4f}, Total: {total_loss.item():.4f}")
+                    f"DFL: {dfl_loss.item():.4f}, Total: {total_loss.item():.4f}, Time: {end_time - start_time:.4f}s")
         
         scheduler.step()
         
